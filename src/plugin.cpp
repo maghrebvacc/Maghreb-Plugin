@@ -157,7 +157,7 @@ json FetchJsonDataStars(
 {
     std::string url =
         "https://raw.githubusercontent.com/"
-        "maghrebvacc/Maghreb-Plugin/main/build/stars/" +
+        "maghrebvacc/Maghreb-Plugin/main/DATA/stars" +
         airport + ".json";
 
     std::string response = HttpGet(url);
