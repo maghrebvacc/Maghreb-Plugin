@@ -21,5 +21,16 @@
       "SADIC": "SADIC4A",
       "TUSOR": "TUSOR4A",
       "VONCI": "VONCI4A"
-    }
+    },
+  "loas": { 
+    "FOBAC": "FL160 Level FOBAC",
+    "LACAJ": "FL160 Level LACAJ",
+    "LAKAM": "FL160 Level LAKAM",
+    "MABOG": "FL160 Level MABOG",
+    "NIKZO": "FL160 Level NIKZO",
+    "RAVOL": "FL160 Level RAVOL",
+    "SADIC": "FL160 Level SADIC",
+    "TUSOR": "FL160 Level TUSOR",
+    "VONCI": "FL160 Level VONCI"
+  }
   }
