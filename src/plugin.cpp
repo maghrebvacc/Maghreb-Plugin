@@ -1,10 +1,14 @@
 #include <windows.h>
 #include <string>
-#include <objidl.h>   
+#include <objidl.h>
 #include <gdiplus.h>
+
+#define DllSpecEuroScope
+#define ESINDEX void *
 #include "EuroScopePlugIn.h"
+
 #include "TopSkyFunctions.h"
-#include "S-Mode.h"
+#include "S-Mode/S-Mode.h"
 #include "IndraApcInterop.h"
 #include <map>
 
@@ -14,15 +18,32 @@
 
 #include <set>
 
+#include "AIRACChecker/Version.h"
+
 #pragma comment(lib, "gdiplus.lib")
-#pragma comment(linker, "/EXPORT:EuroScopePlugInInit=_EuroScopePlugInInit")
-#pragma comment(linker, "/EXPORT:EuroScopePlugInExit=_EuroScopePlugInExit")
+
+/*/ For future maintainers of this plugin:
+ * This is how you change the AIRAC which the plugin is designed for
+ * This fetches from the Github Repo where you also must update the Latest AIRAC
+ * As of 09 / 06 / 2026 I was in the process of fetching from the Users Loaded (.sct) file
+ * If you are seeing this that was obviously not successful and i wish the next person good luck
+ */
+
+const int AIRACDesignedFor = 2606;
+
+/*/
+ * Another message to future maintainers:
+ * I wish you the best of luck with this codebase
+ * it was made by a person learning C++ on the job
+ * and a small bit of AI when i couldnt do something
+ * it is very shoddy, especially this file, the rest somewhat make sense
+ */
 
 using namespace EuroScopePlugIn;
 using namespace Gdiplus;
 using namespace std;
 
-int state = 0; 
+int state = 0;
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -201,8 +222,8 @@ json FetchJsonDataRoutes(
 
     if (!routedata.contains(destairport))
         return json();
-    
-    return routedata[destairport]; 
+
+    return routedata[destairport];
 }
 
 void FillRoundedRect(Graphics& g, Brush& brush, int x, int y, int w, int h, int radius)
@@ -243,6 +264,7 @@ const int RTE_CHECKER_FUNCTION = 112;
 
 std::map<std::string, int> starState;
 std::map<std::string, std::string> CorrectStar;
+std::set<std::string> autoStarProcessed;
 
 std::map<std::string, int> RouteState;
 
@@ -439,7 +461,6 @@ public:
                 SolidBrush IndraOnColour(Color(235, 0, 200, 0));
                 graphics.FillRectangle(&IndraOnColour, panelX + 160, panelY + 164.5, 7.5, 7.5);
                 if (!Indra_sent_drawn){
-                IndraApcInterop::Undraw();
                 int indra_sent_drawn = 1;
                 }
             }
@@ -448,7 +469,6 @@ public:
                 SolidBrush IndraOffColour(Color(235, 250, 67, 67));
                 graphics.FillRectangle(&IndraOffColour, panelX + 160, panelY + 164.5, 7.5, 7.5);
                 if (Indra_sent_drawn){
-                IndraApcInterop::Draw();
                 int indra_sent_drawn = 0;
                 }
             }
@@ -597,6 +617,28 @@ public:
             "GPL V3"
         )
     {
+        try
+        {
+            std::string LatestAIRAC = FetchJsonVersionControl();
+            if (stoi(LatestAIRAC) > AIRACDesignedFor)
+            {
+                std::string OutOfDateMessage =
+                    "Your sectorfile is currently out of date, the latest version is " +
+                    LatestAIRAC +
+                    ". Please update your sectorfile before connecting to the network.";
+
+                MessageBoxA(NULL, OutOfDateMessage.c_str(), "Maghreb vACC", MB_OK | MB_ICONERROR);
+            }
+        }
+        catch (...)
+        {
+            MessageBoxA(
+                NULL,
+                "Could not check latest AIRAC version. Plugin will continue loading.",
+                "Maghreb vACC",
+                MB_OK | MB_ICONWARNING
+            );
+        }
         RegisterTagItemType("Star TAG Display", STAR_TAG_ID);
         RegisterTagItemFunction("STAR Click", STAR_TAG_FUNCTION);
 
@@ -612,7 +654,79 @@ public:
         );
     }
 
-    virtual void OnTime() {}
+    virtual void OnFlightPlanDisconnect(CFlightPlan fp) override
+    {
+        if (!fp.IsValid()) return;
+        std::string callsign = fp.GetCallsign();
+        autoStarProcessed.erase(callsign);
+        starState.erase(callsign);
+        CorrectStar.erase(callsign);
+    }
+
+    void AutoCheckStar(CFlightPlan fp, const std::string& callsign)
+    {
+        if (!fp.IsValid()) return;
+
+        CFlightPlanData fpData = fp.GetFlightPlanData();
+
+        std::string StarName = fpData.GetStarName();
+        std::string airport  = fpData.GetDestination();
+        std::string runway   = fpData.GetArrivalRwy();
+
+        // Mark processed immediately so we don't retry every radar tick
+        // regardless of whether we find a matching STAR or not
+        autoStarProcessed.insert(callsign);
+
+        if (StarName.empty() || airport.empty() || runway.empty())
+        {
+            // Nothing to check — keep whatever is there and go green
+            starState[callsign] = 2;
+            return;
+        }
+
+        std::string fix = StarName.substr(0, 5);
+
+        json result = FetchJsonDataStars(airport, runway, fix);
+
+        // No data found for this airport/runway/fix combo — keep current STAR and go green
+        if (result.is_null() || result.is_discarded() || !result.is_string())
+        {
+            CorrectStar[callsign] = StarName;
+            starState[callsign]   = 2;
+            return;
+        }
+
+        std::string correctStar;
+        try
+        {
+            correctStar = result.get<std::string>();
+        }
+        catch (...)
+        {
+            // JSON type mismatch or other error — keep current STAR and go green
+            CorrectStar[callsign] = StarName;
+            starState[callsign]   = 2;
+            return;
+        }
+
+        if (correctStar.empty())
+        {
+            CorrectStar[callsign] = StarName;
+            starState[callsign]   = 2;
+            return;
+        }
+
+        CorrectStar[callsign] = correctStar;
+        starState[callsign]   = 1;
+
+        // Only amend if the STAR actually needs changing
+        if (StarName != correctStar)
+        {
+            std::string oldRoute = fpData.GetRoute();
+            change_route(fpData, oldRoute, correctStar, runway);
+            fpData.AmendFlightPlan();
+        }
+    }
 
     virtual void OnFunctionCall(int FunctionId, const char* sItemString, POINT Pt, RECT Area) override
     {
@@ -625,96 +739,127 @@ public:
             if (!fp.IsValid()) return;
 
             CFlightPlanData fpData = fp.GetFlightPlanData();
-
             std::string callsign = rt.GetCallsign();
-            CSectorElement secElm = CSectorElement();
 
             std::string StarName = fpData.GetStarName();
             std::string airport  = fpData.GetDestination();
             std::string runway   = fp.GetFlightPlanData().GetArrivalRwy();
-            std::string fix      = StarName.substr(0, 5);
 
-            std::string new_star = FetchJsonDataStars(airport, runway, fix).get<std::string>();
+            if (StarName.empty() || airport.empty() || runway.empty()) return;
+
+            std::string fix = StarName.substr(0, 5);
+
+            json result = FetchJsonDataStars(airport, runway, fix);
+
+            // Default to keeping the current STAR if lookup fails
+            std::string new_star = StarName;
+            if (!result.is_null() && !result.is_discarded() && result.is_string())
+            {
+                try
+                {
+                    new_star = result.get<std::string>();
+                }
+                catch (...)
+                {
+                    new_star = StarName;
+                }
+            }
+
+            if (new_star.empty()) new_star = StarName;
 
             CorrectStar[callsign] = new_star;
 
-            int& state = starState[callsign];
-            if (state == 0) {
-                state = 1;
-            } else if (state == 1) {
-                state = 2;
-            } else if (state == 2) {
-                state = 1;
-            }
+            int& st = starState[callsign];
+            if (st == 0)      st = 1;
+            else if (st == 1) st = 2;
+            else if (st == 2) st = 1;
         }
 
-            if (FunctionId == RTE_CHECKER_FUNCTION)
+        if (FunctionId == RTE_CHECKER_FUNCTION)
+        {
+            CFlightPlan fp = FlightPlanSelectASEL();
+            if (!fp.IsValid()) return;
+
+            CFlightPlanData fpData = fp.GetFlightPlanData();
+
+            std::string callsign    = std::string(fp.GetCallsign());
+            std::string depairport  = fpData.GetOrigin();
+            std::string destairport = fpData.GetDestination();
+
+            json routeData = FetchJsonDataRoutes(depairport, destairport);
+            int& rteState  = RouteState[callsign];
+
+            if (routeData.is_null() || routeData.is_discarded() || !routeData.is_string())
             {
-                CFlightPlan fp = FlightPlanSelectASEL();
-                if (!fp.IsValid()) return;
-
-                CFlightPlanData fpData = fp.GetFlightPlanData();
-
-                std::string callsign = std::string(fp.GetCallsign());
-                std::string depairport  = fpData.GetOrigin();
-                std::string destairport = fpData.GetDestination();
-
-                json routeData = FetchJsonDataRoutes(depairport, destairport);
-                int& rteState = RouteState[callsign];
-
-                if (routeData.is_null() || routeData.is_discarded() || !routeData.is_string()) {
-                    RouteState[callsign] = 2;  // no route in DB = green
-                    return;
-                }
-
-                std::string currentRoute = std::string(fpData.GetRoute());
-                std::string correctRoute = routeData.get<std::string>();
-
-                if (currentRoute != correctRoute) {
-                    std::string route_message = "The route for " + callsign + " is invalid. Please do NOT let them depart on this route.";
-                    DisplayUserMessage("Route Checker", "Maghreb vACC", route_message.c_str(), true,false,true,true,true);
-                    std::string route_message_acc_route = "The Correct route for " + callsign + " is " + correctRoute;
-                    DisplayUserMessage("Route Checker", "Maghreb vACC", route_message_acc_route.c_str(), true,false,true,true,true);
-                    DisplayUserMessage("Route Checker", "Maghreb vACC", "ONLY when the pilot has said they can take this new route, right click on 'RTE' and it will change their route", true,false,true,true,true);
-                }
-
-                if (correctRoute == "") {
-                    rteState = 2;
-                } else if (currentRoute == correctRoute) {
-                    rteState = 2;
-                } else {
-                    rteState = 1;
-                }
-
+                RouteState[callsign] = 2;  // no route in DB = green
+                return;
             }
-            if (FunctionId == RTE_CHANGER_FUNCTION)
+
+            std::string currentRoute = std::string(fpData.GetRoute());
+            std::string correctRoute;
+            try
             {
-                CFlightPlan fp = FlightPlanSelectASEL();
-                if (!fp.IsValid()) return;
-
-                CFlightPlanData fpData = fp.GetFlightPlanData();
-
-                std::string callsign    = std::string(fp.GetCallsign());
-                std::string depairport  = fpData.GetOrigin();
-                std::string destairport = fpData.GetDestination();
-
-                json routeData = FetchJsonDataRoutes(depairport, destairport);
-
-                if (routeData.is_null() || routeData.is_discarded() || !routeData.is_string())
-                    return;
-
-                std::string correctRoute = routeData.get<std::string>();
-
-                if (correctRoute.empty())
-                    return;
-
-                fpData.SetRoute(correctRoute.c_str());
-                fpData.AmendFlightPlan();
-                RouteState[callsign] = 3;
-
-                std::string route_change_message = "The Route for " + callsign + " has been changed to " + correctRoute;
-                DisplayUserMessage("Route Checker", "Maghreb vACC", route_change_message.c_str(), true, false, true, true, true);
+                correctRoute = routeData.get<std::string>();
             }
+            catch (...)
+            {
+                RouteState[callsign] = 2;
+                return;
+            }
+
+            if (currentRoute != correctRoute)
+            {
+                std::string route_message = "The route for " + callsign + " is invalid. Please do NOT let them depart on this route.";
+                DisplayUserMessage("Route Checker", "Maghreb vACC", route_message.c_str(), true, false, true, true, true);
+                std::string route_message_acc_route = "The Correct route for " + callsign + " is " + correctRoute;
+                DisplayUserMessage("Route Checker", "Maghreb vACC", route_message_acc_route.c_str(), true, false, true, true, true);
+                DisplayUserMessage("Route Checker", "Maghreb vACC", "ONLY when the pilot has said they can take this new route, right click on 'RTE' and it will change their route", true, false, true, true, true);
+            }
+
+            if (correctRoute.empty())
+                rteState = 2;
+            else if (currentRoute == correctRoute)
+                rteState = 2;
+            else
+                rteState = 1;
+        }
+
+        if (FunctionId == RTE_CHANGER_FUNCTION)
+        {
+            CFlightPlan fp = FlightPlanSelectASEL();
+            if (!fp.IsValid()) return;
+
+            CFlightPlanData fpData = fp.GetFlightPlanData();
+
+            std::string callsign    = std::string(fp.GetCallsign());
+            std::string depairport  = fpData.GetOrigin();
+            std::string destairport = fpData.GetDestination();
+
+            json routeData = FetchJsonDataRoutes(depairport, destairport);
+
+            if (routeData.is_null() || routeData.is_discarded() || !routeData.is_string())
+                return;
+
+            std::string correctRoute;
+            try
+            {
+                correctRoute = routeData.get<std::string>();
+            }
+            catch (...)
+            {
+                return;
+            }
+
+            if (correctRoute.empty())
+                return;
+
+            fpData.SetRoute(correctRoute.c_str());
+            fpData.AmendFlightPlan();
+            RouteState[callsign] = 3;
+
+            std::string route_change_message = "The Route for " + callsign + " has been changed to " + correctRoute;
+            DisplayUserMessage("Route Checker", "Maghreb vACC", route_change_message.c_str(), true, false, true, true, true);
+        }
     }
 
     virtual void OnGetTagItem(
@@ -736,43 +881,37 @@ public:
             CFlightPlanData fpData = FlightPlan.GetFlightPlanData();
 
             std::string StarName = fpData.GetStarName();
-            std::string airport  = fpData.GetDestination();
             std::string runway   = FlightPlan.GetFlightPlanData().GetArrivalRwy();
-            std::string fix      = StarName.substr(0, 5);
 
-            auto new_star = CorrectStar.find(callsign);
+            // Always show something — default to current STAR name in red
             strncpy_s(sItemString, 16, StarName.c_str(), _TRUNCATE);
             *pRgbColor  = RGB(255, 92, 103);
             *pColorCode = TAG_COLOR_RGB_DEFINED;
 
-            std::string old_route = fpData.GetRoute();
-
+            auto new_star = CorrectStar.find(callsign);
             if (new_star == CorrectStar.end())
                 return;
 
             auto it = starState.find(callsign);
-            if (it != starState.end())
-            {
-                *pColorCode = TAG_COLOR_RGB_DEFINED;
-                *pRgbColor  = RGB(255, 92, 103);
+            if (it == starState.end())
+                return;
 
-                int routeState = it->second;
-                switch (routeState)
-                {
-                    case 0:
-                        strncpy_s(sItemString, 16, StarName.c_str(), _TRUNCATE);
-                        *pRgbColor = RGB(255, 92, 103);
-                        break;
-                    case 1:
-                        strncpy_s(sItemString, 16, new_star->second.c_str(), _TRUNCATE);
-                        *pRgbColor = RGB(237, 186, 57);
-                        change_route(fpData, old_route, new_star->second, runway);
-                        break;
-                    case 2:
-                        strncpy_s(sItemString, 16, new_star->second.c_str(), _TRUNCATE);
-                        *pRgbColor = RGB(99, 255, 107);
-                        break;
-                }
+            switch (it->second)
+            {
+                case 0:
+                    strncpy_s(sItemString, 16, StarName.c_str(), _TRUNCATE);
+                    *pRgbColor = RGB(255, 92, 103);
+                    break;
+                case 1:
+                    strncpy_s(sItemString, 16, new_star->second.c_str(), _TRUNCATE);
+                    *pRgbColor = RGB(237, 186, 57);
+                    // NOTE: change_route removed from here — tag refresh fires every
+                    // radar scan so route mutations belong only in OnFunctionCall
+                    break;
+                case 2:
+                    strncpy_s(sItemString, 16, new_star->second.c_str(), _TRUNCATE);
+                    *pRgbColor = RGB(99, 255, 107);
+                    break;
             }
         }
 
@@ -784,24 +923,24 @@ public:
             strncpy_s(sItemString, 16, "RTE", _TRUNCATE);
             *pColorCode = TAG_COLOR_RGB_DEFINED;
             *pRgbColor  = RGB(255, 92, 103);
+
             std::string callsign = FlightPlan.GetCallsign();
             auto it = RouteState.find(callsign);
             if (it != RouteState.end())
             {
-                int routeState = it->second;
-                switch (routeState)
+                switch (it->second)
                 {
                     case 1:
-                        *pRgbColor = RGB(255, 92, 103);  // red - bad route
+                        *pRgbColor = RGB(255, 92, 103);   // red — bad route
                         break;
                     case 2:
-                        *pRgbColor = RGB(99, 255, 107);  // green - good route
+                        *pRgbColor = RGB(99, 255, 107);   // green — good route
                         break;
                     case 3:
-                        *pRgbColor = RGB(247, 171, 20);  // green - good route
+                        *pRgbColor = RGB(247, 171, 20);   // amber — route changed
                         break;
                     default:
-                        *pRgbColor = RGB(255, 92, 103);  // red - unchecked
+                        *pRgbColor = RGB(255, 92, 103);   // red — unchecked
                         break;
                 }
             }
@@ -821,25 +960,33 @@ public:
 
     virtual void OnRadarTargetPositionUpdate(CRadarTarget rt) override
     {
-        if (!rt.IsValid())
-            return;
+        if (!rt.IsValid()) return;
 
         const char* callsign = rt.GetCallsign();
-        if (!callsign)
-            return;
+        if (!callsign) return;
 
         CFlightPlan fp = rt.GetCorrelatedFlightPlan();
-        if (!fp.IsValid())
-            return;
+        if (!fp.IsValid()) return;
+
+        // Auto Star logic
+        if (Auto_Star && autoStarProcessed.find(callsign) == autoStarProcessed.end())
+        {
+            int fpState = fp.GetState();
+            if (fpState == FLIGHT_PLAN_STATE_ASSUMED)
+            {
+                AutoCheckStar(fp, callsign);
+            }
+        }
 
         if (m_Screen)
             m_Screen->RequestRefresh();
     }
 
-    virtual ~MyPlugIn() {}
+    ~MyPlugIn() override {}
 };
 
 MyPlugIn* gPlugin = nullptr;
+
 
 __declspec(dllexport) void EuroScopePlugInInit(CPlugIn** ppPlugIn)
 {
@@ -849,4 +996,6 @@ __declspec(dllexport) void EuroScopePlugInInit(CPlugIn** ppPlugIn)
 
 __declspec(dllexport) void EuroScopePlugInExit()
 {
+    delete gPlugin;
+    gPlugin = nullptr;
 }
